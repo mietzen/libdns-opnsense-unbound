@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/libdns/libdns"
+	"go.uber.org/zap"
 )
 
 // Provider facilitates DNS record manipulation with OPNsense Unbound.
@@ -33,6 +34,9 @@ type Provider struct {
 	Insecure bool `json:"insecure,omitempty"`
 	// Description is set on created host entries (defaults to "Managed by Caddy")
 	Description string `json:"description,omitempty"`
+	// Logger is an optional logger. If set, warnings will be logged using this logger.
+	// When used with Caddy, set this to ctx.Logger() during Provision to match Caddy's log format.
+	Logger *zap.Logger `json:"-"`
 
 	client     *http.Client
 	clientOnce sync.Once
@@ -100,6 +104,13 @@ func (p *Provider) getDescription() string {
 	return "Managed by Caddy"
 }
 
+func (p *Provider) getLogger() *zap.Logger {
+	if p.Logger != nil {
+		return p.Logger
+	}
+	return zap.NewNop()
+}
+
 func (p *Provider) baseURL() string {
 	return fmt.Sprintf("https://%s/api/unbound", p.Host)
 }
@@ -161,6 +172,12 @@ func (p *Provider) addHostOverride(ctx context.Context, hostname, domain, ip str
 		rr = "AAAA"
 	}
 
+	p.getLogger().Debug("adding host override",
+		zap.String("hostname", hostname),
+		zap.String("domain", domain),
+		zap.String("type", rr),
+		zap.String("ip", ip))
+
 	reqData := addHostOverrideRequest{
 		Host: addHostOverrideData{
 			Enabled:     "1",
@@ -197,6 +214,8 @@ func (p *Provider) addHostOverride(ctx context.Context, hostname, domain, ip str
 }
 
 func (p *Provider) deleteHostOverride(ctx context.Context, uuid string) error {
+	p.getLogger().Debug("deleting host override", zap.String("uuid", uuid))
+
 	respBody, err := p.doRequest(ctx, http.MethodPost, "settings/del_host_override/"+uuid, nil)
 	if err != nil {
 		return err
@@ -215,6 +234,8 @@ func (p *Provider) deleteHostOverride(ctx context.Context, uuid string) error {
 }
 
 func (p *Provider) reconfigure(ctx context.Context) error {
+	p.getLogger().Debug("reconfiguring unbound service")
+
 	respBody, err := p.doRequest(ctx, http.MethodPost, "service/reconfigure", nil)
 	if err != nil {
 		return err
@@ -229,12 +250,35 @@ func (p *Provider) reconfigure(ctx context.Context) error {
 		return fmt.Errorf("failed to reconfigure: %s", result.Message)
 	}
 
+	p.getLogger().Info("unbound service reconfigured")
 	return nil
 }
 
 // trimZone removes the trailing dot from a zone name
 func trimZone(zone string) string {
 	return strings.TrimSuffix(zone, ".")
+}
+
+// resolveHostAndDomain handles the special case where name is "@" (zone apex).
+// For unbound, we need to split the zone into hostname and domain parts.
+// e.g., zone "my_domain.com" with name "@" becomes hostname "my_domain" and domain "com"
+func resolveHostAndDomain(name, zone string) (hostname, domain string) {
+	zone = trimZone(zone)
+	if name == "@" || name == "" {
+		// Zone apex: split the zone at the first dot
+		if idx := strings.Index(zone, "."); idx > 0 {
+			return zone[:idx], zone[idx+1:]
+		}
+		// No dot in zone, use zone as hostname with empty domain (edge case)
+		return zone, ""
+	}
+	// Normal subdomain
+	return name, zone
+}
+
+// isWildcard checks if the name is a wildcard record
+func isWildcard(name string) bool {
+	return name == "*" || strings.HasPrefix(name, "*.")
 }
 
 // hostOverrideToRecord converts an unboundHostOverride to a libdns.Address record
@@ -252,17 +296,27 @@ func hostOverrideToRecord(h unboundHostOverride) (libdns.Address, error) {
 
 // GetRecords lists all the records in the zone.
 func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	p.getLogger().Debug("getting records", zap.String("zone", zone))
+
 	hosts, err := p.searchHostOverrides(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("searching host overrides: %w", err)
 	}
 
-	domain := trimZone(zone)
+	zone = trimZone(zone)
 	var records []libdns.Record
 
 	for _, h := range hosts {
-		if h.Domain != domain {
-			continue
+		var name string
+
+		if h.Domain == zone {
+			// Normal subdomain: hostname "example" in domain "my_domain.com"
+			name = h.Hostname
+		} else if h.Hostname+"."+h.Domain == zone {
+			// Apex record: hostname "my_domain" in domain "com" for zone "my_domain.com"
+			name = "@"
+		} else {
+			continue // not part of this zone
 		}
 
 		// Only return A and AAAA records
@@ -271,19 +325,36 @@ func (p *Provider) GetRecords(ctx context.Context, zone string) ([]libdns.Record
 			continue
 		}
 
-		addr, err := hostOverrideToRecord(h)
+		ip, err := netip.ParseAddr(h.Server)
 		if err != nil {
 			continue // skip invalid entries
 		}
-		records = append(records, addr)
+
+		p.getLogger().Debug("found DNS record",
+			zap.String("type", rr),
+			zap.String("name", name),
+			zap.String("zone", zone),
+			zap.String("value", ip.String()))
+
+		records = append(records, libdns.Address{
+			Name: name,
+			IP:   ip,
+		})
 	}
+
+	p.getLogger().Debug("finished getting records",
+		zap.String("zone", zone),
+		zap.Int("count", len(records)))
 
 	return records, nil
 }
 
 // AppendRecords adds records to the zone. It returns the records that were added.
 func (p *Provider) AppendRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	domain := trimZone(zone)
+	p.getLogger().Debug("appending records",
+		zap.String("zone", zone),
+		zap.Int("count", len(records)))
+
 	var added []libdns.Record
 
 	for _, record := range records {
@@ -300,10 +371,26 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			return added, fmt.Errorf("invalid IP address %q: %w", rr.Data, err)
 		}
 
-		// Get the relative name (hostname part)
+		// Get the relative name (hostname part) and resolve hostname/domain for unbound
 		name := libdns.RelativeName(rr.Name, zone)
 
-		if err := p.addHostOverride(ctx, name, domain, ip.String()); err != nil {
+		// Skip wildcard records - unbound doesn't support them
+		if isWildcard(name) {
+			p.getLogger().Warn("skipping wildcard record - unbound does not support wildcard host overrides, consider using dnsmasq instead",
+				zap.String("record", name),
+				zap.String("zone", zone))
+			continue
+		}
+
+		p.getLogger().Info("appending DNS record",
+			zap.String("zone", zone),
+			zap.String("name", name),
+			zap.String("type", rr.Type),
+			zap.String("ip", ip.String()))
+
+		hostname, domain := resolveHostAndDomain(name, zone)
+
+		if err := p.addHostOverride(ctx, hostname, domain, ip.String()); err != nil {
 			return added, fmt.Errorf("adding host override %q: %w", name, err)
 		}
 
@@ -325,7 +412,9 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 // SetRecords sets the records in the zone, either by updating existing records or creating new ones.
 // It returns the updated records.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	domain := trimZone(zone)
+	p.getLogger().Debug("setting records",
+		zap.String("zone", zone),
+		zap.Int("count", len(records)))
 
 	// Get existing host overrides
 	existingHosts, err := p.searchHostOverrides(ctx)
@@ -333,12 +422,11 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 		return nil, fmt.Errorf("searching host overrides: %w", err)
 	}
 
-	// Build a map of existing hosts by hostname for this domain
-	existingByName := make(map[string]unboundHostOverride)
+	// Build a map of existing hosts by hostname:domain key
+	existingByKey := make(map[string]unboundHostOverride)
 	for _, h := range existingHosts {
-		if h.Domain == domain {
-			existingByName[h.Hostname] = h
-		}
+		key := h.Hostname + ":" + h.Domain
+		existingByKey[key] = h
 	}
 
 	var results []libdns.Record
@@ -360,8 +448,19 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 
 		name := libdns.RelativeName(rr.Name, zone)
 
+		// Skip wildcard records - unbound doesn't support them
+		if isWildcard(name) {
+			p.getLogger().Warn("skipping wildcard record - unbound does not support wildcard host overrides, consider using dnsmasq instead",
+				zap.String("record", name),
+				zap.String("zone", zone))
+			continue
+		}
+
+		hostname, domain := resolveHostAndDomain(name, zone)
+		key := hostname + ":" + domain
+
 		// Check if an entry already exists
-		if existing, ok := existingByName[name]; ok {
+		if existing, ok := existingByKey[key]; ok {
 			// Determine expected record type
 			expectedRR := "A"
 			if ip.Is6() {
@@ -379,6 +478,11 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 				existing.MXPrio == "" &&
 				existing.MX == "" {
 				// Already correct, no changes needed
+				p.getLogger().Debug("record already up to date",
+					zap.String("zone", zone),
+					zap.String("name", name),
+					zap.String("type", expectedRR),
+					zap.String("ip", ip.String()))
 				results = append(results, libdns.Address{
 					Name: name,
 					IP:   ip,
@@ -387,14 +491,31 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 			}
 
 			// Delete the old entry
+			p.getLogger().Info("updating DNS record",
+				zap.String("zone", zone),
+				zap.String("name", name),
+				zap.String("type", expectedRR),
+				zap.String("old_ip", existing.Server),
+				zap.String("new_ip", ip.String()))
 			if err := p.deleteHostOverride(ctx, existing.UUID); err != nil {
 				return results, fmt.Errorf("deleting existing host override %q: %w", name, err)
 			}
 			needsReconfigure = true
+		} else {
+			// Determine record type for logging
+			recType := "A"
+			if ip.Is6() {
+				recType = "AAAA"
+			}
+			p.getLogger().Info("creating DNS record",
+				zap.String("zone", zone),
+				zap.String("name", name),
+				zap.String("type", recType),
+				zap.String("ip", ip.String()))
 		}
 
 		// Add the new entry
-		if err := p.addHostOverride(ctx, name, domain, ip.String()); err != nil {
+		if err := p.addHostOverride(ctx, hostname, domain, ip.String()); err != nil {
 			return results, fmt.Errorf("adding host override %q: %w", name, err)
 		}
 		needsReconfigure = true
@@ -416,7 +537,9 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 
 // DeleteRecords deletes the specified records from the zone. It returns the records that were deleted.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
-	domain := trimZone(zone)
+	p.getLogger().Debug("deleting records",
+		zap.String("zone", zone),
+		zap.Int("count", len(records)))
 
 	// Get existing host overrides
 	existingHosts, err := p.searchHostOverrides(ctx)
@@ -424,12 +547,11 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 		return nil, fmt.Errorf("searching host overrides: %w", err)
 	}
 
-	// Build a map of existing hosts by hostname for this domain
-	existingByName := make(map[string]unboundHostOverride)
+	// Build a map of existing hosts by hostname:domain key
+	existingByKey := make(map[string]unboundHostOverride)
 	for _, h := range existingHosts {
-		if h.Domain == domain {
-			existingByName[h.Hostname] = h
-		}
+		key := h.Hostname + ":" + h.Domain
+		existingByKey[key] = h
 	}
 
 	var deleted []libdns.Record
@@ -437,11 +559,21 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 	for _, record := range records {
 		rr := record.RR()
 		name := libdns.RelativeName(rr.Name, zone)
+		hostname, domain := resolveHostAndDomain(name, zone)
+		key := hostname + ":" + domain
 
-		existing, ok := existingByName[name]
+		existing, ok := existingByKey[key]
 		if !ok {
+			p.getLogger().Debug("record not found, skipping delete",
+				zap.String("zone", zone),
+				zap.String("name", name))
 			continue // record doesn't exist, nothing to delete
 		}
+
+		p.getLogger().Info("deleting DNS record",
+			zap.String("zone", zone),
+			zap.String("name", name),
+			zap.String("ip", existing.Server))
 
 		if err := p.deleteHostOverride(ctx, existing.UUID); err != nil {
 			return deleted, fmt.Errorf("deleting host override %q: %w", name, err)
