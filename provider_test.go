@@ -305,6 +305,7 @@ func TestAppendRecords(t *testing.T) {
 
 				if strings.HasPrefix(r.URL.Path, "/api/unbound/settings/add_host_override") {
 					addCount++
+					verifyAddPtrRequest(t, r)
 					_ = json.NewEncoder(w).Encode(apiResponse{Result: "saved"})
 					return
 				}
@@ -471,7 +472,7 @@ func TestSetRecords(t *testing.T) {
 			name: "skip identical record",
 			zone: "example.com",
 			existingHosts: []unboundHostOverride{
-				{UUID: "uuid-1", Hostname: "www", Domain: "example.com", Server: "192.168.1.1", RR: "A", Enabled: "1", Description: "Managed by Caddy"},
+				{UUID: "uuid-1", Hostname: "www", Domain: "example.com", Server: "192.168.1.1", RR: "A", Enabled: "1", AddPtr: "0", Description: "Managed by Caddy"},
 			},
 			recordsToSet: []libdns.Record{
 				libdns.Address{Name: "www", IP: mustParseAddr("192.168.1.1")},
@@ -480,8 +481,20 @@ func TestSetRecords(t *testing.T) {
 			expectDelete: 0,
 		},
 		{
-			name: "skip wildcard record",
+			name: "update record with PTR enabled",
 			zone: "example.com",
+			existingHosts: []unboundHostOverride{
+				{UUID: "uuid-1", Hostname: "www", Domain: "example.com", Server: "192.168.1.1", RR: "A", Enabled: "1", AddPtr: "1", Description: "Managed by Caddy"},
+			},
+			recordsToSet: []libdns.Record{
+				libdns.Address{Name: "www", IP: mustParseAddr("192.168.1.1")},
+			},
+			expectAdd:    1,
+			expectDelete: 1,
+		},
+		{
+			name:          "skip wildcard record",
+			zone:          "example.com",
 			existingHosts: []unboundHostOverride{},
 			recordsToSet: []libdns.Record{
 				libdns.Address{Name: "*.sub", IP: mustParseAddr("192.168.1.1")},
@@ -506,6 +519,7 @@ func TestSetRecords(t *testing.T) {
 				}
 				if strings.HasPrefix(r.URL.Path, "/api/unbound/settings/add_host_override") {
 					addCount++
+					verifyAddPtrRequest(t, r)
 					_ = json.NewEncoder(w).Encode(apiResponse{Result: "saved"})
 					return
 				}
@@ -578,6 +592,19 @@ func TestAPIErrorHandling(t *testing.T) {
 				t.Errorf("error should contain 'API error', got: %v", err)
 			}
 		})
+	}
+}
+
+func verifyAddPtrRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+
+	var req addHostOverrideRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		t.Errorf("failed to decode add_host_override request: %v", err)
+		return
+	}
+	if req.Host.AddPtr != "0" {
+		t.Errorf("addptr = %q, want %q", req.Host.AddPtr, "0")
 	}
 }
 
