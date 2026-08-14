@@ -52,6 +52,7 @@ type unboundHostOverride struct {
 	MXPrio      string `json:"mxprio"`
 	MX          string `json:"mx"`
 	Server      string `json:"server"`
+	AddPtr      string `json:"addptr"`
 	Description string `json:"description"`
 }
 
@@ -73,6 +74,7 @@ type addHostOverrideData struct {
 	MXPrio      string `json:"mxprio"`
 	MX          string `json:"mx"`
 	Server      string `json:"server"`
+	AddPtr      string `json:"addptr"`
 	Description string `json:"description"`
 }
 
@@ -187,6 +189,7 @@ func (p *Provider) addHostOverride(ctx context.Context, hostname, domain, ip str
 			MXPrio:      "",
 			MX:          "",
 			Server:      ip,
+			AddPtr:      "0",
 			Description: p.getDescription(),
 		},
 	}
@@ -476,7 +479,8 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 				existing.Description == p.getDescription() &&
 				existingRR == expectedRR &&
 				existing.MXPrio == "" &&
-				existing.MX == "" {
+				existing.MX == "" &&
+				existing.AddPtr == "0" {
 				// Already correct, no changes needed
 				p.getLogger().Debug("record already up to date",
 					zap.String("zone", zone),
